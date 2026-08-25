@@ -1,0 +1,19 @@
+{
+  "name": "机柜拍照与报告助手",
+  "short_name": "机柜拍照",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#062b58",
+  "theme_color": "#062b58",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
