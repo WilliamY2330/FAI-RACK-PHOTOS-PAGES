@@ -1,5 +1,5 @@
-const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["./PhotoCrop-BV-V7oOs.js","./index-DjxDXT3H.js","./index-BFnC5q7t.css","./CropFrame-DVvYiU4m.js","./LiveCamera-ClNwdGaM.js"])))=>i.map(i=>d[i]);
-import{c as mt,r as lt,j as h,a as Ft,g as Ae,_ as ue}from"./index-DjxDXT3H.js";/**
+const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["./PhotoCrop-BV-V7oOs.js","./index-DjxDXT3H-r1.js","./index-BFnC5q7t.css","./CropFrame-DVvYiU4m.js","./LiveCamera-ClNwdGaM.js"])))=>i.map(i=>d[i]);
+import{c as mt,r as lt,j as h,a as Ft,g as Ae,_ as ue}from"./index-DjxDXT3H-r1.js";/**
  * @license lucide-react v0.468.0 - ISC
  *
  * This source code is licensed under the ISC license.
