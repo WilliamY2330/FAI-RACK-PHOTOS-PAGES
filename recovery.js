@@ -48,33 +48,37 @@ async function openExistingDb() {
   })
 }
 
-function readWorkspace(db) {
+function readRecord(db, key, timeoutMs) {
   return new Promise((resolve, reject) => {
     if (!db.objectStoreNames.contains(STORE_NAME)) {
       reject(new Error('数据库中没有 projects 数据表。'))
       return
     }
     const tx = db.transaction(STORE_NAME, 'readonly')
-    statusBox.textContent = '正在读取大型项目记录（约 480 MB 照片引用），请保持 PWA 在前台，最多等待 3 分钟…'
     const timer = window.setTimeout(() => {
       try { tx.abort() } catch {}
-      reject(new Error('读取项目记录超过 3 分钟。请先重启 iPhone 后再试；重启不会删除 PWA 数据。'))
-    }, 180000)
+      reject(new Error(`读取 ${key} 记录超时。`))
+    }, timeoutMs)
     const store = tx.objectStore(STORE_NAME)
-    const workspaceRequest = store.get('workspace')
-    workspaceRequest.onsuccess = () => {
-      if (workspaceRequest.result) {
-        window.clearTimeout(timer)
-        resolve(workspaceRequest.result)
-        return
-      }
-      const legacyRequest = store.get('active')
-      legacyRequest.onsuccess = () => { window.clearTimeout(timer); resolve(legacyRequest.result) }
-      legacyRequest.onerror = () => { window.clearTimeout(timer); reject(legacyRequest.error) }
-    }
-    workspaceRequest.onerror = () => { window.clearTimeout(timer); reject(workspaceRequest.error) }
+    const request = store.get(key)
+    request.onsuccess = () => { window.clearTimeout(timer); resolve(request.result) }
+    request.onerror = () => { window.clearTimeout(timer); reject(request.error) }
     tx.onerror = () => { window.clearTimeout(timer); reject(tx.error) }
   })
+}
+
+async function readWorkspace(db) {
+  statusBox.textContent = '正在先尝试较小的旧项目记录，请保持 PWA 在前台…'
+  try {
+    const active = await readRecord(db, 'active', 30000)
+    if (active && workspaceProjects(active).length) return active
+  } catch {}
+  statusBox.textContent = '未找到可用的旧项目记录；正在读取大型 workspace（约 480 MB 照片引用），最多等待 3 分钟…'
+  try {
+    return await readRecord(db, 'workspace', 180000)
+  } catch {
+    throw new Error('旧 active 记录不可用，workspace 记录也超过 3 分钟。浏览器内只读恢复路径已用尽。')
+  }
 }
 
 function workspaceProjects(workspace) {
