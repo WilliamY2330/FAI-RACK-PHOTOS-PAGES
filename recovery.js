@@ -212,6 +212,51 @@ async function probeBlob(blob, field) {
   }
 }
 
+function expectedSize(candidate, field) {
+  if (field === 'blob') return Number(candidate.compressedBytes || candidate.bytes || 0)
+  if (field === 'originalBlob') return Number(candidate.originalBytes || 0)
+  return 0
+}
+
+function canvasBlob(canvas, type = 'image/jpeg', quality = 0.9) {
+  return new Promise((resolve, reject) => canvas.toBlob(
+    blob => blob ? resolve(blob) : reject(new Error('Canvas produced no image bytes')),
+    type,
+    quality,
+  ))
+}
+
+async function rebuildProcessedFromOriginal(originalBlob, candidate, preferredMethod = '') {
+  const recovered = await recoverBlobBuffer(originalBlob, 'originalBlob', preferredMethod)
+  const stableBlob = new Blob([recovered.buffer], { type: originalBlob.type || 'image/jpeg' })
+  const url = URL.createObjectURL(stableBlob)
+  try {
+    const image = await withTimeout(new Promise((resolve, reject) => {
+      const element = new Image()
+      element.onload = () => resolve(element)
+      element.onerror = () => reject(new Error('Original image decoder failed'))
+      element.src = url
+    }), 15000, 'Original image decoder timed out')
+    const crop = candidate.crop || { x: 0, y: 0, width: 1, height: 1 }
+    const sx = Math.max(0, Math.round(crop.x * image.naturalWidth))
+    const sy = Math.max(0, Math.round(crop.y * image.naturalHeight))
+    const sw = Math.max(1, Math.min(image.naturalWidth - sx, Math.round(crop.width * image.naturalWidth)))
+    const sh = Math.max(1, Math.min(image.naturalHeight - sy, Math.round(crop.height * image.naturalHeight)))
+    const width = Math.max(1, Number(candidate.width) || sw)
+    const height = Math.max(1, Number(candidate.height) || sh)
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas unavailable for crop reconstruction')
+    context.drawImage(image, sx, sy, sw, sh, 0, 0, width, height)
+    const rebuilt = await canvasBlob(canvas, 'image/jpeg', 0.9)
+    return { buffer: await rebuilt.arrayBuffer(), blob: rebuilt }
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
 async function scanDatabase() {
   progress.classList.remove('hidden')
   stats.classList.add('hidden')
@@ -227,13 +272,14 @@ async function scanDatabase() {
 
   const candidates = allCandidates(workspace, projectId)
   const records = []
-  progress.max = Math.max(1, candidates.length * 2)
+  progress.max = Math.max(1, candidates.length * 3)
   progress.value = 0
   for (const item of candidates) {
     const variants = []
-    for (const field of ['blob', 'thumbnailBlob']) {
+    for (const field of ['blob', 'originalBlob', 'thumbnailBlob']) {
       const result = await probeBlob(item.candidate[field], field)
-      variants.push({ field, ...result })
+      const expected = expectedSize(item.candidate, field)
+      variants.push({ field, expectedSize: expected, sizeMatches: Boolean(expected && result.size === expected), ...result })
       progress.value += 1
       statusBox.textContent = `正在扫描：第 ${records.length + 1} / ${candidates.length} 个照片候选…`
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -255,17 +301,19 @@ async function scanDatabase() {
 
   const readableCandidates = records.filter(record => record.variants.some(variant => variant.readable))
   const readableVariants = records.flatMap(record => record.variants).filter(variant => variant.readable)
-  scanResult = { scannedAt: new Date().toISOString(), records, readableCandidates, readableVariants }
+  const safeCandidates = records.filter(record => record.variants.some(variant => variant.readable && variant.sizeMatches && ['blob', 'originalBlob'].includes(variant.field)))
+  scanResult = { scannedAt: new Date().toISOString(), records, readableCandidates, readableVariants, safeCandidates }
   stats.innerHTML = `
     <div class="stat"><strong>${candidates.length}</strong>已选照片</div>
     <div class="stat"><strong>${readableCandidates.length}</strong>至少一个副本可读</div>
     <div class="stat"><strong>${readableVariants.length}</strong>可读副本总数</div>
+    <div class="stat"><strong>${safeCandidates.length}</strong>可验证或从原图重建</div>
     <div class="stat"><strong>${candidates.length - readableCandidates.length}</strong>全部副本不可读</div>`
   stats.classList.remove('hidden')
   reportButton.classList.remove('hidden')
-  if (readableCandidates.length) downloadButton.classList.remove('hidden')
-  statusBox.textContent = readableCandidates.length
-    ? `扫描完成：找到 ${readableCandidates.length} 个至少有一个可读副本的照片候选。现在可以下载。`
+  if (safeCandidates.length === candidates.length && candidates.length) downloadButton.classList.remove('hidden')
+  statusBox.textContent = safeCandidates.length
+    ? `扫描完成：${safeCandidates.length} / ${candidates.length} 张可用尺寸吻合的处理图或从原图重建。${safeCandidates.length === candidates.length ? '可以生成恢复 ZIP。' : '数量不足，已阻止生成不完整 ZIP。'}`
     : '扫描完成，但当前数据库中的原图、处理图和缩略图副本均无法读取。请保留设备现状并转入系统备份取证。'
 }
 
@@ -406,28 +454,38 @@ async function downloadRecovered() {
   downloadButton.disabled = true
   reportButton.disabled = true
   progress.classList.remove('hidden')
-  progress.max = Math.max(1, scanResult.readableCandidates.length)
+  progress.max = Math.max(1, scanResult.safeCandidates.length)
   progress.value = 0
   const files = []
   const recoveryReport = []
   let recovered = 0
 
-  for (const record of scanResult.readableCandidates) {
-    const priority = ['blob', 'thumbnailBlob']
+  for (const record of scanResult.safeCandidates) {
     let chosen = null
     let buffer = null
     let lastError = ''
-    for (const field of priority) {
-      const variant = record.variants.find(item => item.field === field && item.readable)
-      const blob = record.source.candidate[field]
-      if (!variant || !(blob instanceof Blob)) continue
+    const candidate = record.source.candidate
+    const processedVariant = record.variants.find(item => item.field === 'blob' && item.readable && item.sizeMatches)
+    if (processedVariant && candidate.blob instanceof Blob) {
       try {
-        const recovered = await recoverBlobBuffer(blob, field, variant.method)
+        const recovered = await recoverBlobBuffer(candidate.blob, 'blob', processedVariant.method)
         buffer = recovered.buffer
-        chosen = { field, blob }
-        break
+        chosen = { field: 'blob-verified', blob: candidate.blob }
       } catch (error) {
         lastError = error?.message || String(error)
+      }
+    }
+
+    if (!chosen) {
+      const originalVariant = record.variants.find(item => item.field === 'originalBlob' && item.readable && item.sizeMatches)
+      if (originalVariant && candidate.originalBlob instanceof Blob) {
+        try {
+          const rebuilt = await rebuildProcessedFromOriginal(candidate.originalBlob, candidate, originalVariant.method)
+          buffer = rebuilt.buffer
+          chosen = { field: 'reconstructed-from-original', blob: rebuilt.blob }
+        } catch (error) {
+          lastError = error?.message || String(error)
+        }
       }
     }
 
@@ -457,7 +515,7 @@ async function downloadRecovered() {
 
   const reportBytes = new TextEncoder().encode(JSON.stringify({ scannedAt: scanResult.scannedAt, exportedAt: new Date().toISOString(), recovered, records: recoveryReport }, null, 2))
   files.push({ name: '03-Project-Package/recovery-report.json', bytes: reportBytes })
-  const project = scanResult.readableCandidates[0]?.source.project
+  const project = scanResult.safeCandidates[0]?.source.project
   if (!project) throw new Error('找不到所选项目的项目结构。')
   const manifestBytes = new TextEncoder().encode(JSON.stringify(archiveManifest(project), null, 2))
   files.push({ name: '03-Project-Package/manifest.json', bytes: manifestBytes })
