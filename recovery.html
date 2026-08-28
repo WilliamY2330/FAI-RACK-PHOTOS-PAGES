@@ -55,6 +55,7 @@
         <p class="safe">只读模式：页面不会建立任何写入事务。</p>
         <p>先读取本机项目列表并选择项目。普通扫描只检查已选照片；“深度扫描全部候选”会检查同一项目中所有重拍候选，用原图与处理图的实际字节双重匹配回原来选中的 point。</p>
         <button id="load-projects">读取本机项目列表</button>
+        <button id="load-workspace" class="secondary">直接读取大型 workspace 原始记录</button>
         <label for="project">选择要恢复的项目</label>
         <select id="project" disabled><option value="">请先读取项目列表</option></select>
         <button id="scan" disabled>扫描所选项目</button>
@@ -68,6 +69,6 @@
         <p><small>最终 ZIP 仍只包含每个 point 当时选中的一张。深度扫描会查看未选中的候选对象来寻找丢失字节，但不会把未选照片混进最终报告；匹配成功的现有处理图会原样导出，不重新压缩。</small></p>
       </section>
     </main>
-    <script type="module" src="./recovery.js?v=20260828-9"></script>
+    <script type="module" src="./recovery.js?v=20260828-10"></script>
   </body>
 </html>
