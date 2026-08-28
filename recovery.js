@@ -12,8 +12,10 @@ const downloadButton = document.querySelector('#download')
 const reportButton = document.querySelector('#report')
 const projectSelect = document.querySelector('#project')
 const scanButton = document.querySelector('#scan')
+const deepScanButton = document.querySelector('#deep-scan')
 
 let scanResult = null
+let deepResult = null
 let workspaceCache = null
 
 function showError(target, message) {
@@ -120,6 +122,42 @@ function allCandidates(workspace, projectId) {
   return items
 }
 
+function allProjectCandidates(workspace, projectId) {
+  const projects = workspaceProjects(workspace).filter(project => project.id === projectId)
+  const items = []
+  for (const project of projects) {
+    for (const page of project.pages || []) {
+      for (const [slotOffset, slot] of (page.slots || []).entries()) {
+        for (const [candidateOffset, candidate] of (slot.candidates || []).entries()) {
+          items.push({
+            project,
+            page,
+            slot,
+            candidate,
+            slotIndex: slotOffset + 1,
+            candidateIndex: candidateOffset + 1,
+          })
+        }
+        if (!slot.candidates?.length && slot.blob) {
+          items.push({
+            project,
+            page,
+            slot,
+            candidate: { id: `${page.id || page.number}-${slot.id || slotOffset}-legacy`, blob: slot.blob, originalBlob: slot.blob },
+            slotIndex: slotOffset + 1,
+            candidateIndex: 1,
+          })
+        }
+      }
+    }
+  }
+  return items
+}
+
+function candidateKey(item) {
+  return [item.project.id || '', item.page.id || item.page.number || '', item.slot.id || item.slotIndex || '', item.candidate.id || item.candidateIndex || ''].join('::')
+}
+
 function withTimeout(promise, milliseconds, message) {
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => reject(new Error(message)), milliseconds)
@@ -203,6 +241,24 @@ async function recoverBlobBuffer(blob, field, preferredMethod = '', expectedByte
   throw new Error(errors.join(' | ') || 'no readable bytes')
 }
 
+async function readRawBlob(blob) {
+  if (!(blob instanceof Blob) || blob.size <= 0) throw new Error('missing blob')
+  const methods = [
+    ['direct', () => blob.arrayBuffer()],
+    ['fileReader', () => fileReaderBuffer(blob)],
+  ]
+  const errors = []
+  for (const [method, read] of methods) {
+    try {
+      const buffer = await withTimeout(Promise.resolve().then(read), 15000, `${method} timed out`)
+      if (buffer?.byteLength > 0) return { buffer, method }
+    } catch (error) {
+      errors.push(`${method}: ${error?.message || String(error)}`)
+    }
+  }
+  throw new Error(errors.join(' | ') || 'no readable bytes')
+}
+
 async function probeBlob(blob, field, expectedBytes = 0) {
   if (!(blob instanceof Blob) || blob.size <= 0) return { readable: false, reason: 'missing' }
   try {
@@ -259,6 +315,7 @@ async function rebuildProcessedFromOriginal(originalBlob, candidate, preferredMe
 }
 
 async function scanDatabase() {
+  deepResult = null
   progress.classList.remove('hidden')
   stats.classList.add('hidden')
   downloadButton.classList.add('hidden')
@@ -318,6 +375,120 @@ async function scanDatabase() {
     : '扫描完成，但当前数据库中的原图、处理图和缩略图副本均无法读取。请保留设备现状并转入系统备份取证。'
 }
 
+async function deepScanCandidatePool() {
+  progress.classList.remove('hidden')
+  stats.classList.add('hidden')
+  downloadButton.classList.add('hidden')
+  reportButton.classList.add('hidden')
+  statusBox.classList.remove('error')
+  statusBox.textContent = '正在准备候选照片深度匹配…'
+
+  const workspace = workspaceCache || await loadProjects()
+  if (!workspace) throw new Error('数据库存在，但没有找到项目记录。')
+  const projectId = projectSelect.value
+  if (!projectId) throw new Error('请先选择要恢复的项目。')
+
+  const targets = allCandidates(workspace, projectId)
+  const pool = allProjectCandidates(workspace, projectId)
+  if (!targets.length) throw new Error('所选项目没有已选照片。')
+  if (!pool.length) throw new Error('所选项目没有可扫描的候选照片。')
+
+  const byProcessedSize = new Map()
+  for (const target of targets) {
+    const processedBytes = expectedSize(target.candidate, 'blob')
+    const originalBytes = expectedSize(target.candidate, 'originalBlob')
+    if (!processedBytes || !originalBytes) continue
+    const entry = { target, key: candidateKey(target), processedBytes, originalBytes }
+    const list = byProcessedSize.get(processedBytes) || []
+    list.push(entry)
+    byProcessedSize.set(processedBytes, list)
+  }
+
+  const pairCounts = new Map()
+  for (const list of byProcessedSize.values()) {
+    for (const entry of list) {
+      const pair = `${entry.processedBytes}:${entry.originalBytes}`
+      pairCounts.set(pair, (pairCounts.get(pair) || 0) + 1)
+    }
+  }
+  const ambiguousPairs = [...pairCounts.values()].filter(count => count > 1).length
+  if (ambiguousPairs) throw new Error(`发现 ${ambiguousPairs} 组重复的原图/处理图尺寸组合，已停止以避免错配。`)
+
+  const matches = new Map()
+  const sourceDiagnostics = []
+  progress.max = Math.max(1, pool.length)
+  progress.value = 0
+
+  for (const source of pool) {
+    const diagnostic = {
+      pageNumber: source.page.number || source.page.outputPageNumber || '',
+      slotIndex: source.slotIndex,
+      slotCode: source.slot.code || source.slot.slotCode || '',
+      candidateIndex: source.candidateIndex,
+      candidateId: source.candidate.id || '',
+      selected: source.slot.selectedCandidateId === source.candidate.id,
+      processedActualBytes: 0,
+      originalActualBytes: 0,
+      matchedTarget: '',
+      error: '',
+    }
+    try {
+      const processed = await readRawBlob(source.candidate.blob)
+      diagnostic.processedActualBytes = processed.buffer.byteLength
+      const possible = (byProcessedSize.get(processed.buffer.byteLength) || []).filter(entry => !matches.has(entry.key))
+      if (possible.length && source.candidate.originalBlob instanceof Blob) {
+        const original = await readRawBlob(source.candidate.originalBlob)
+        diagnostic.originalActualBytes = original.buffer.byteLength
+        const paired = possible.filter(entry => entry.originalBytes === original.buffer.byteLength)
+        if (paired.length === 1) {
+          const match = paired[0]
+          matches.set(match.key, {
+            target: match.target,
+            source,
+            processedBuffer: processed.buffer,
+            processedMethod: processed.method,
+            originalMethod: original.method,
+            processedActualBytes: processed.buffer.byteLength,
+            originalActualBytes: original.buffer.byteLength,
+          })
+          diagnostic.matchedTarget = match.key
+        } else if (paired.length > 1) {
+          diagnostic.error = 'ambiguous byte-length pair'
+        }
+      }
+    } catch (error) {
+      diagnostic.error = error?.message || String(error)
+    }
+    sourceDiagnostics.push(diagnostic)
+    progress.value += 1
+    statusBox.textContent = `正在扫描全部候选：${progress.value} / ${progress.max}；已精确匹配 ${matches.size} / ${targets.length} 张…`
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+
+  const unresolved = targets.filter(target => !matches.has(candidateKey(target)))
+  deepResult = {
+    scannedAt: new Date().toISOString(),
+    project: targets[0]?.project,
+    targets,
+    poolCount: pool.length,
+    matches,
+    unresolved,
+    sourceDiagnostics,
+  }
+  scanResult = null
+  stats.innerHTML = `
+    <div class="stat"><strong>${targets.length}</strong>已选照片</div>
+    <div class="stat"><strong>${pool.length}</strong>全部候选照片</div>
+    <div class="stat"><strong>${matches.size}</strong>原图＋处理图双重匹配</div>
+    <div class="stat"><strong>${unresolved.length}</strong>仍未匹配</div>`
+  stats.classList.remove('hidden')
+  reportButton.classList.remove('hidden')
+  if (!unresolved.length) downloadButton.classList.remove('hidden')
+  statusBox.textContent = unresolved.length
+    ? `深度扫描完成：精确找回 ${matches.size} / ${targets.length} 张；仍缺 ${unresolved.length} 张，已阻止生成不完整 ZIP。请下载诊断清单。`
+    : `深度扫描完成：${targets.length} 张全部通过原图与处理图实际字节双重匹配。可以生成 PowerPoint 恢复 ZIP。`
+}
+
 async function loadProjects() {
   statusBox.classList.remove('error')
   statusBox.textContent = '正在以只读方式读取项目列表…'
@@ -335,6 +506,7 @@ async function loadProjects() {
   }).join('')
   projectSelect.disabled = false
   scanButton.disabled = false
+  deepScanButton.disabled = false
   statusBox.textContent = `已找到 ${projects.length} 个项目。请选择一个项目，再开始扫描。`
   return workspaceCache
 }
@@ -451,6 +623,7 @@ function archiveManifest(project) {
 }
 
 async function downloadRecovered() {
+  if (deepResult) return downloadDeepRecovered()
   if (!scanResult) return
   downloadButton.disabled = true
   reportButton.disabled = true
@@ -529,7 +702,84 @@ async function downloadRecovered() {
   reportButton.disabled = false
 }
 
+async function downloadDeepRecovered() {
+  if (!deepResult || deepResult.unresolved.length) throw new Error('深度匹配尚未找齐全部已选照片。')
+  downloadButton.disabled = true
+  reportButton.disabled = true
+  progress.classList.remove('hidden')
+  progress.max = deepResult.targets.length
+  progress.value = 0
+  const files = []
+  const recoveryReport = []
+
+  for (const target of deepResult.targets) {
+    const match = deepResult.matches.get(candidateKey(target))
+    if (!match?.processedBuffer) throw new Error(`缺少第 ${target.page.number || ''} 页第 ${target.slotIndex} 个位置的处理图。`)
+    const page = String(target.page.number || target.page.outputPageNumber || 0).padStart(2, '0')
+    const slot = String(target.slotIndex).padStart(2, '0')
+    const type = match.source.candidate.blob?.type || target.candidate.blob?.type || 'image/jpeg'
+    const ext = extensionFor(type, target.candidate.originalName || target.candidate.name || '')
+    const name = `02-Report-Photos/page-${page}_slot-${slot}_${safeAscii(target.slot.code || target.slot.slotCode || '')}.${ext}`
+    files.push({ name, bytes: new Uint8Array(match.processedBuffer) })
+    recoveryReport.push({
+      projectName: target.project.name || '',
+      pageNumber: target.page.number || target.page.outputPageNumber || '',
+      pageTitle: target.page.title || '',
+      slotIndex: target.slotIndex,
+      slotCode: target.slot.code || target.slot.slotCode || '',
+      selectedCandidateIndex: target.candidateIndex,
+      selectedCandidateId: target.candidate.id || '',
+      sourcePageNumber: match.source.page.number || match.source.page.outputPageNumber || '',
+      sourceSlotIndex: match.source.slotIndex,
+      sourceCandidateIndex: match.source.candidateIndex,
+      sourceCandidateId: match.source.candidate.id || '',
+      processedActualBytes: match.processedActualBytes,
+      originalActualBytes: match.originalActualBytes,
+      crop: target.candidate.crop || null,
+      width: target.candidate.width || null,
+      height: target.candidate.height || null,
+      fileName: name,
+    })
+    progress.value += 1
+    statusBox.textContent = `正在打包精确匹配照片：${progress.value} / ${progress.max}…`
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+
+  const mapHeaders = ['projectName', 'pageNumber', 'pageTitle', 'slotIndex', 'slotCode', 'selectedCandidateIndex', 'selectedCandidateId', 'sourcePageNumber', 'sourceSlotIndex', 'sourceCandidateIndex', 'sourceCandidateId', 'processedActualBytes', 'originalActualBytes', 'fileName']
+  const mapRows = recoveryReport.map(record => mapHeaders.map(key => String(record[key] ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t'))
+  files.push({ name: '03-Project-Package/recovery-map.tsv', bytes: new TextEncoder().encode(`\uFEFF${[mapHeaders.join('\t'), ...mapRows].join('\r\n')}\r\n`) })
+  files.push({ name: 'README.txt', bytes: new TextEncoder().encode('Every exported image was matched to the selected target by both processed-image byte length and original-image byte length. Exact existing processed JPEG bytes are exported without re-encoding.\r\n') })
+  files.push({ name: '03-Project-Package/recovery-report.json', bytes: new TextEncoder().encode(JSON.stringify({ scannedAt: deepResult.scannedAt, exportedAt: new Date().toISOString(), method: 'all-candidate-pool-dual-byte-match', recovered: recoveryReport.length, records: recoveryReport }, null, 2)) })
+  files.push({ name: '03-Project-Package/manifest.json', bytes: new TextEncoder().encode(JSON.stringify(archiveManifest(deepResult.project), null, 2)) })
+
+  const archive = zipArchive(files)
+  if (['127.0.0.1', 'localhost'].includes(location.hostname)) window.__recoveryArchive = archive
+  triggerDownload(archive, `${safeAscii(deepResult.project.name || 'FAI-project')}_deep-recovered-powerpoint-import.zip`)
+  statusBox.textContent = `深度恢复 ZIP 已生成：${recoveryReport.length} 张均经过原图与处理图双重匹配，处理图字节原样导出，没有重新压缩。`
+  downloadButton.disabled = false
+  reportButton.disabled = false
+}
+
 function publicReport() {
+  if (deepResult) {
+    return {
+      scannedAt: deepResult.scannedAt,
+      method: 'all-candidate-pool-dual-byte-match',
+      selectedCount: deepResult.targets.length,
+      poolCount: deepResult.poolCount,
+      matchedCount: deepResult.matches.size,
+      unresolved: deepResult.unresolved.map(item => ({
+        pageNumber: item.page.number || item.page.outputPageNumber || '',
+        slotIndex: item.slotIndex,
+        slotCode: item.slot.code || item.slot.slotCode || '',
+        candidateIndex: item.candidateIndex,
+        candidateId: item.candidate.id || '',
+        expectedProcessedBytes: expectedSize(item.candidate, 'blob'),
+        expectedOriginalBytes: expectedSize(item.candidate, 'originalBlob'),
+      })),
+      sourceDiagnostics: deepResult.sourceDiagnostics,
+    }
+  }
   return {
     scannedAt: scanResult?.scannedAt,
     records: (scanResult?.records || []).map(({ source, ...record }) => record),
@@ -582,6 +832,20 @@ scanButton.addEventListener('click', async event => {
     showError(statusBox, error?.message || String(error))
   } finally {
     button.disabled = false
+  }
+})
+
+deepScanButton.addEventListener('click', async event => {
+  const button = event.currentTarget
+  button.disabled = true
+  scanButton.disabled = true
+  try {
+    await deepScanCandidatePool()
+  } catch (error) {
+    showError(statusBox, error?.message || String(error))
+  } finally {
+    button.disabled = false
+    scanButton.disabled = false
   }
 })
 
