@@ -1,6 +1,7 @@
 const DB_NAME = 'rack-photo-pwa'
 const STORE_NAME = 'projects'
 const ACCESS_HASH = '70f2f92eae1c13a821d9f0699d7bc42313c3e588e8c30d5b5cdbe9f02987ba3b'
+const PRETEST3_LATE_PHOTO_CUTOFF_MS = 1787872950935
 
 const gate = document.querySelector('#gate')
 const recovery = document.querySelector('#recovery')
@@ -14,6 +15,7 @@ const originalsButton = document.querySelector('#download-originals')
 const projectSelect = document.querySelector('#project')
 const scanButton = document.querySelector('#scan')
 const deepScanButton = document.querySelector('#deep-scan')
+const workspaceButton = document.querySelector('#load-workspace')
 
 let scanResult = null
 let deepResult = null
@@ -162,6 +164,47 @@ function allProjectCandidates(workspace, projectId) {
 
 function candidateKey(item) {
   return [item.project.id || '', item.page.id || item.page.number || '', item.slot.id || item.slotIndex || '', item.candidate.id || item.candidateIndex || ''].join('::')
+}
+
+function candidateTimestamp(candidate) {
+  const match = String(candidate?.id || '').match(/^candidate-(\d+)-/)
+  return match ? Number(match[1]) : 0
+}
+
+function recoveryTargets(workspace, projectId) {
+  const selected = allCandidates(workspace, projectId)
+  const projectName = String(selected[0]?.project?.name || '').trim().toLowerCase()
+  if (projectName === 'pretest 3' && selected.length === 85) {
+    const originalSession = selected.filter(item => {
+      const timestamp = candidateTimestamp(item.candidate)
+      return timestamp > 0 && timestamp < PRETEST3_LATE_PHOTO_CUTOFF_MS
+    })
+    if (originalSession.length === 62) return originalSession
+  }
+  return selected
+}
+
+function recoveryProject(project) {
+  if (String(project?.name || '').trim().toLowerCase() !== 'pretest 3') return project
+  return {
+    ...project,
+    pages: (project.pages || []).map(page => ({
+      ...page,
+      slots: (page.slots || []).map(slot => {
+        const selected = (slot.candidates || []).find(candidate => candidate.id === slot.selectedCandidateId)
+        const selectedIsLate = candidateTimestamp(selected) >= PRETEST3_LATE_PHOTO_CUTOFF_MS
+        return {
+          ...slot,
+          status: selectedIsLate ? 'pending' : slot.status,
+          selectedCandidateId: selectedIsLate ? null : slot.selectedCandidateId,
+          candidates: (slot.candidates || []).filter(candidate => {
+            const timestamp = candidateTimestamp(candidate)
+            return !timestamp || timestamp < PRETEST3_LATE_PHOTO_CUTOFF_MS
+          }),
+        }
+      }),
+    })),
+  }
 }
 
 function withTimeout(promise, milliseconds, message) {
@@ -396,7 +439,7 @@ async function deepScanCandidatePool() {
   const projectId = projectSelect.value
   if (!projectId) throw new Error('请先选择要恢复的项目。')
 
-  const targets = allCandidates(workspace, projectId)
+  const targets = recoveryTargets(workspace, projectId)
   const pool = allProjectCandidates(workspace, projectId)
   if (!targets.length) throw new Error('所选项目没有已选照片。')
   if (!pool.length) throw new Error('所选项目没有可扫描的候选照片。')
@@ -501,7 +544,7 @@ async function deepScanCandidatePool() {
   const unresolved = targets.filter(target => !matches.has(candidateKey(target)))
   deepResult = {
     scannedAt: new Date().toISOString(),
-    project: targets[0]?.project,
+    project: recoveryProject(targets[0]?.project),
     targets,
     pool,
     poolCount: pool.length,
@@ -524,15 +567,8 @@ async function deepScanCandidatePool() {
     : `深度扫描完成：${targets.length} 张全部找到可验证的处理图或唯一原图。可以生成 PowerPoint 恢复 ZIP。`
 }
 
-async function loadProjects() {
-  statusBox.classList.remove('error')
-  statusBox.textContent = '正在以只读方式读取项目列表…'
-  const db = await openExistingDb()
-  try {
-    workspaceCache = await readWorkspace(db)
-  } finally {
-    db.close()
-  }
+function populateProjectList(workspace, sourceLabel) {
+  workspaceCache = workspace
   const projects = workspaceProjects(workspaceCache)
   if (!projects.length) throw new Error('数据库存在，但没有找到项目记录。')
   projectSelect.innerHTML = projects.map(project => {
@@ -542,8 +578,41 @@ async function loadProjects() {
   projectSelect.disabled = false
   scanButton.disabled = false
   deepScanButton.disabled = false
-  statusBox.textContent = `已找到 ${projects.length} 个项目。请选择一个项目，再开始扫描。`
+  statusBox.textContent = `已从 ${sourceLabel} 找到 ${projects.length} 个项目。请选择 Pretest 3，再点“深度扫描全部候选照片”。`
   return workspaceCache
+}
+
+async function loadProjects() {
+  statusBox.classList.remove('error')
+  statusBox.textContent = '正在以只读方式读取快速 active 记录…'
+  const db = await openExistingDb()
+  try {
+    const workspace = await readWorkspace(db)
+    return populateProjectList(workspace, 'active/兼容记录')
+  } finally {
+    db.close()
+  }
+}
+
+async function loadLargeWorkspace() {
+  statusBox.classList.remove('error')
+  projectSelect.disabled = true
+  scanButton.disabled = true
+  deepScanButton.disabled = true
+  downloadButton.classList.add('hidden')
+  originalsButton.classList.add('hidden')
+  reportButton.classList.add('hidden')
+  statusBox.textContent = '正在绕过 active，直接读取大型 workspace 原始记录。请保持 PWA 在前台，最多等待 10 分钟…'
+  const db = await openExistingDb()
+  try {
+    const workspace = await readRecord(db, 'workspace', 600000)
+    if (!workspace) throw new Error('workspace 记录不存在。')
+    return populateProjectList(workspace, '大型 workspace 原始记录')
+  } catch (error) {
+    throw new Error(`大型 workspace 读取失败：${error?.message || String(error)}`)
+  } finally {
+    db.close()
+  }
 }
 
 function safeAscii(value) {
@@ -958,6 +1027,18 @@ document.querySelector('#load-projects').addEventListener('click', async event =
   button.disabled = true
   try {
     await loadProjects()
+  } catch (error) {
+    showError(statusBox, error?.message || String(error))
+  } finally {
+    button.disabled = false
+  }
+})
+
+workspaceButton.addEventListener('click', async event => {
+  const button = event.currentTarget
+  button.disabled = true
+  try {
+    await loadLargeWorkspace()
   } catch (error) {
     showError(statusBox, error?.message || String(error))
   } finally {
