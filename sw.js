@@ -2,7 +2,7 @@ const CACHE_PREFIX = 'rack-photo-'
 const scopeUrl = new URL(self.registration.scope)
 const scopeKey = scopeUrl.pathname.replace(/[^a-z0-9]+/gi, '-') || 'root'
 const scopeCachePrefix = `${CACHE_PREFIX}${scopeKey}`
-const CACHE = `${scopeCachePrefix}v7`
+const CACHE = `${scopeCachePrefix}v8`
 const SHELL = ['', 'index.html', 'manifest.webmanifest', 'icon.svg', 'recovery.html', 'recovery.js'].map(path => new URL(path, scopeUrl).href)
 
 self.addEventListener('install', (event) => event.waitUntil(
