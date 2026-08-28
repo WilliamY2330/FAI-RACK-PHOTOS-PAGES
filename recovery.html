@@ -53,19 +53,20 @@
       <section id="recovery" class="hidden">
         <h2>恢复扫描</h2>
         <p class="safe">只读模式：页面不会建立任何写入事务。</p>
-        <p>先读取本机项目列表，选择需要恢复的一个项目。每个 point 只恢复原应用中已经选中的那张照片；处理图尺寸吻合时直接采用，否则按保存的裁切参数从原图重建。</p>
+        <p>先读取本机项目列表并选择项目。普通扫描只检查已选照片；“深度扫描全部候选”会检查同一项目中所有重拍候选，用原图与处理图的实际字节双重匹配回原来选中的 point。</p>
         <button id="load-projects">读取本机项目列表</button>
         <label for="project">选择要恢复的项目</label>
         <select id="project" disabled><option value="">请先读取项目列表</option></select>
         <button id="scan" disabled>扫描所选项目</button>
+        <button id="deep-scan" class="secondary" disabled>深度扫描全部候选照片</button>
         <progress id="progress" class="hidden" value="0" max="1"></progress>
         <div id="stats" class="stats hidden"></div>
         <button id="download" class="secondary hidden">下载 PowerPoint 恢复 ZIP</button>
         <button id="report" class="secondary hidden">下载诊断清单（JSON）</button>
         <div id="status" class="status">尚未扫描。</div>
-        <p><small>ZIP 会生成 PowerPoint 导入器需要的项目清单和照片目录。文件按页面和 point 顺序排列；未选中的候选照片不会进入最终恢复包。</small></p>
+        <p><small>最终 ZIP 仍只包含每个 point 当时选中的一张。深度扫描会查看未选中的候选对象来寻找丢失字节，但不会把未选照片混进最终报告；匹配成功的现有处理图会原样导出，不重新压缩。</small></p>
       </section>
     </main>
-    <script type="module" src="./recovery.js?v=20260828-6"></script>
+    <script type="module" src="./recovery.js?v=20260828-7"></script>
   </body>
 </html>
