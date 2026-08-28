@@ -55,10 +55,11 @@ function readWorkspace(db) {
       return
     }
     const tx = db.transaction(STORE_NAME, 'readonly')
+    statusBox.textContent = '正在读取大型项目记录（约 480 MB 照片引用），请保持 PWA 在前台，最多等待 3 分钟…'
     const timer = window.setTimeout(() => {
       try { tx.abort() } catch {}
-      reject(new Error('读取项目记录超过 30 秒。数据库中的照片对象可能已损坏。'))
-    }, 30000)
+      reject(new Error('读取项目记录超过 3 分钟。请先重启 iPhone 后再试；重启不会删除 PWA 数据。'))
+    }, 180000)
     const store = tx.objectStore(STORE_NAME)
     const workspaceRequest = store.get('workspace')
     workspaceRequest.onsuccess = () => {
@@ -222,11 +223,11 @@ async function scanDatabase() {
 
   const candidates = allCandidates(workspace, projectId)
   const records = []
-  progress.max = Math.max(1, candidates.length * 3)
+  progress.max = Math.max(1, candidates.length * 2)
   progress.value = 0
   for (const item of candidates) {
     const variants = []
-    for (const field of ['originalBlob', 'blob', 'thumbnailBlob']) {
+    for (const field of ['blob', 'thumbnailBlob']) {
       const result = await probeBlob(item.candidate[field], field)
       variants.push({ field, ...result })
       progress.value += 1
@@ -408,7 +409,7 @@ async function downloadRecovered() {
   let recovered = 0
 
   for (const record of scanResult.readableCandidates) {
-    const priority = ['blob', 'originalBlob', 'thumbnailBlob']
+    const priority = ['blob', 'thumbnailBlob']
     let chosen = null
     let buffer = null
     let lastError = ''
