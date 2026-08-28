@@ -178,18 +178,24 @@ function decodedImageBuffer(blob) {
   })
 }
 
-async function recoverBlobBuffer(blob, field, preferredMethod = '') {
+async function recoverBlobBuffer(blob, field, preferredMethod = '', expectedBytes = 0) {
   const methods = [
     ['direct', () => blob.arrayBuffer()],
     ['fileReader', () => fileReaderBuffer(blob)],
   ]
-  if (field !== 'originalBlob') methods.push(['imageDecoder', () => decodedImageBuffer(blob)])
+  if (!expectedBytes && field !== 'originalBlob') methods.push(['imageDecoder', () => decodedImageBuffer(blob)])
   if (preferredMethod) methods.sort(([name]) => name === preferredMethod ? -1 : 1)
   const errors = []
   for (const [method, read] of methods) {
     try {
       const buffer = await withTimeout(Promise.resolve().then(read), 10000, `${method} timed out`)
-      if (buffer?.byteLength > 0) return { buffer, method }
+      if (buffer?.byteLength > 0) {
+        if (expectedBytes && buffer.byteLength !== expectedBytes) {
+          errors.push(`${method}: actual ${buffer.byteLength} bytes, expected ${expectedBytes}`)
+          continue
+        }
+        return { buffer, method }
+      }
     } catch (error) {
       errors.push(`${method}: ${error?.message || String(error)}`)
     }
@@ -197,18 +203,13 @@ async function recoverBlobBuffer(blob, field, preferredMethod = '') {
   throw new Error(errors.join(' | ') || 'no readable bytes')
 }
 
-async function probeBlob(blob, field) {
+async function probeBlob(blob, field, expectedBytes = 0) {
   if (!(blob instanceof Blob) || blob.size <= 0) return { readable: false, reason: 'missing' }
   try {
-    await blob.slice(0, Math.min(blob.size, 65536)).arrayBuffer()
-    return { readable: true, method: 'direct', size: blob.size, type: blob.type || 'application/octet-stream' }
-  } catch (quickError) {
-    try {
-      const recovered = await recoverBlobBuffer(blob, field)
-      return { readable: true, method: recovered.method, size: blob.size, recoveredBytes: recovered.buffer.byteLength, type: blob.type || 'application/octet-stream' }
-    } catch (deepError) {
-      return { readable: false, size: blob.size, type: blob.type || '', reason: `${quickError?.message || String(quickError)} | ${deepError?.message || String(deepError)}` }
-    }
+    const recovered = await recoverBlobBuffer(blob, field, '', expectedBytes)
+    return { readable: true, method: recovered.method, size: blob.size, actualBytes: recovered.buffer.byteLength, type: blob.type || 'application/octet-stream' }
+  } catch (error) {
+    return { readable: false, size: blob.size, actualBytes: 0, type: blob.type || '', reason: error?.message || String(error) }
   }
 }
 
@@ -227,7 +228,7 @@ function canvasBlob(canvas, type = 'image/jpeg', quality = 0.9) {
 }
 
 async function rebuildProcessedFromOriginal(originalBlob, candidate, preferredMethod = '') {
-  const recovered = await recoverBlobBuffer(originalBlob, 'originalBlob', preferredMethod)
+  const recovered = await recoverBlobBuffer(originalBlob, 'originalBlob', preferredMethod, Number(candidate.originalBytes || 0))
   const stableBlob = new Blob([recovered.buffer], { type: originalBlob.type || 'image/jpeg' })
   const url = URL.createObjectURL(stableBlob)
   try {
@@ -277,9 +278,9 @@ async function scanDatabase() {
   for (const item of candidates) {
     const variants = []
     for (const field of ['blob', 'originalBlob', 'thumbnailBlob']) {
-      const result = await probeBlob(item.candidate[field], field)
       const expected = expectedSize(item.candidate, field)
-      variants.push({ field, expectedSize: expected, sizeMatches: Boolean(expected && result.size === expected), ...result })
+      const result = await probeBlob(item.candidate[field], field, expected)
+      variants.push({ field, expectedSize: expected, sizeMatches: Boolean(expected && result.actualBytes === expected), ...result })
       progress.value += 1
       statusBox.textContent = `正在扫描：第 ${records.length + 1} / ${candidates.length} 个照片候选…`
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -468,7 +469,7 @@ async function downloadRecovered() {
     const processedVariant = record.variants.find(item => item.field === 'blob' && item.readable && item.sizeMatches)
     if (processedVariant && candidate.blob instanceof Blob) {
       try {
-        const recovered = await recoverBlobBuffer(candidate.blob, 'blob', processedVariant.method)
+        const recovered = await recoverBlobBuffer(candidate.blob, 'blob', processedVariant.method, expectedSize(candidate, 'blob'))
         buffer = recovered.buffer
         chosen = { field: 'blob-verified', blob: candidate.blob }
       } catch (error) {
