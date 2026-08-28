@@ -394,6 +394,7 @@ async function deepScanCandidatePool() {
   if (!pool.length) throw new Error('所选项目没有可扫描的候选照片。')
 
   const byProcessedSize = new Map()
+  const byOriginalSize = new Map()
   for (const target of targets) {
     const processedBytes = expectedSize(target.candidate, 'blob')
     const originalBytes = expectedSize(target.candidate, 'originalBlob')
@@ -402,6 +403,9 @@ async function deepScanCandidatePool() {
     const list = byProcessedSize.get(processedBytes) || []
     list.push(entry)
     byProcessedSize.set(processedBytes, list)
+    const originalList = byOriginalSize.get(originalBytes) || []
+    originalList.push(entry)
+    byOriginalSize.set(originalBytes, originalList)
   }
 
   const pairCounts = new Map()
@@ -430,35 +434,56 @@ async function deepScanCandidatePool() {
       processedActualBytes: 0,
       originalActualBytes: 0,
       matchedTarget: '',
+      matchMode: '',
       error: '',
     }
+    let processed = null
+    let original = null
+    const readErrors = []
     try {
-      const processed = await readRawBlob(source.candidate.blob)
+      processed = await readRawBlob(source.candidate.blob)
       diagnostic.processedActualBytes = processed.buffer.byteLength
-      const possible = (byProcessedSize.get(processed.buffer.byteLength) || []).filter(entry => !matches.has(entry.key))
-      if (possible.length && source.candidate.originalBlob instanceof Blob) {
-        const original = await readRawBlob(source.candidate.originalBlob)
-        diagnostic.originalActualBytes = original.buffer.byteLength
-        const paired = possible.filter(entry => entry.originalBytes === original.buffer.byteLength)
-        if (paired.length === 1) {
-          const match = paired[0]
-          matches.set(match.key, {
-            target: match.target,
-            source,
-            processedBuffer: processed.buffer,
-            processedMethod: processed.method,
-            originalMethod: original.method,
-            processedActualBytes: processed.buffer.byteLength,
-            originalActualBytes: original.buffer.byteLength,
-          })
-          diagnostic.matchedTarget = match.key
-        } else if (paired.length > 1) {
-          diagnostic.error = 'ambiguous byte-length pair'
-        }
-      }
     } catch (error) {
-      diagnostic.error = error?.message || String(error)
+      readErrors.push(`processed: ${error?.message || String(error)}`)
     }
+    try {
+      original = await readRawBlob(source.candidate.originalBlob)
+      diagnostic.originalActualBytes = original.buffer.byteLength
+    } catch (error) {
+      readErrors.push(`original: ${error?.message || String(error)}`)
+    }
+
+    const processedTargets = processed
+      ? (byProcessedSize.get(processed.buffer.byteLength) || []).filter(entry => !matches.has(entry.key))
+      : []
+    const originalTargets = original
+      ? (byOriginalSize.get(original.buffer.byteLength) || []).filter(entry => !matches.has(entry.key))
+      : []
+    const paired = original ? processedTargets.filter(entry => entry.originalBytes === original.buffer.byteLength) : []
+    const originalOnly = originalTargets.length === 1 ? originalTargets[0] : null
+    const processedOnly = processedTargets.length === 1 ? processedTargets[0] : null
+    const match = paired.length === 1 ? paired[0] : (originalOnly || processedOnly)
+    if (match) {
+      const dualMatch = paired.length === 1
+      const originalMatch = Boolean(original && (dualMatch || match.originalBytes === original.buffer.byteLength))
+      const exactProcessed = Boolean(processed && (dualMatch || processedOnly === match))
+      matches.set(match.key, {
+        target: match.target,
+        source,
+        mode: exactProcessed ? 'exact-processed' : 'rebuild-from-original',
+        processedBuffer: exactProcessed ? processed.buffer : null,
+        processedMethod: processed?.method || '',
+        originalMethod: original?.method || '',
+        processedActualBytes: processed?.buffer.byteLength || 0,
+        originalActualBytes: original?.buffer.byteLength || 0,
+        originalMatched: originalMatch,
+      })
+      diagnostic.matchedTarget = match.key
+      diagnostic.matchMode = dualMatch ? 'processed+original' : (originalMatch ? 'original-only' : 'processed-only')
+    } else if (paired.length > 1) {
+      readErrors.push('ambiguous byte-length pair')
+    }
+    diagnostic.error = readErrors.join(' | ')
     sourceDiagnostics.push(diagnostic)
     progress.value += 1
     statusBox.textContent = `正在扫描全部候选：${progress.value} / ${progress.max}；已精确匹配 ${matches.size} / ${targets.length} 张…`
@@ -479,14 +504,14 @@ async function deepScanCandidatePool() {
   stats.innerHTML = `
     <div class="stat"><strong>${targets.length}</strong>已选照片</div>
     <div class="stat"><strong>${pool.length}</strong>全部候选照片</div>
-    <div class="stat"><strong>${matches.size}</strong>原图＋处理图双重匹配</div>
+    <div class="stat"><strong>${matches.size}</strong>可精确导出或由原图重建</div>
     <div class="stat"><strong>${unresolved.length}</strong>仍未匹配</div>`
   stats.classList.remove('hidden')
   reportButton.classList.remove('hidden')
   if (!unresolved.length) downloadButton.classList.remove('hidden')
   statusBox.textContent = unresolved.length
     ? `深度扫描完成：精确找回 ${matches.size} / ${targets.length} 张；仍缺 ${unresolved.length} 张，已阻止生成不完整 ZIP。请下载诊断清单。`
-    : `深度扫描完成：${targets.length} 张全部通过原图与处理图实际字节双重匹配。可以生成 PowerPoint 恢复 ZIP。`
+    : `深度扫描完成：${targets.length} 张全部找到可验证的处理图或唯一原图。可以生成 PowerPoint 恢复 ZIP。`
 }
 
 async function loadProjects() {
@@ -714,13 +739,21 @@ async function downloadDeepRecovered() {
 
   for (const target of deepResult.targets) {
     const match = deepResult.matches.get(candidateKey(target))
-    if (!match?.processedBuffer) throw new Error(`缺少第 ${target.page.number || ''} 页第 ${target.slotIndex} 个位置的处理图。`)
+    if (!match) throw new Error(`缺少第 ${target.page.number || ''} 页第 ${target.slotIndex} 个位置的照片。`)
+    let outputBuffer = match.processedBuffer
+    let exportedVariant = 'exact-existing-processed'
+    if (!outputBuffer && match.mode === 'rebuild-from-original') {
+      const rebuilt = await rebuildProcessedFromOriginal(match.source.candidate.originalBlob, target.candidate, match.originalMethod)
+      outputBuffer = rebuilt.buffer
+      exportedVariant = 'rebuilt-from-uniquely-matched-original'
+    }
+    if (!outputBuffer) throw new Error(`第 ${target.page.number || ''} 页第 ${target.slotIndex} 个位置无法生成处理图。`)
     const page = String(target.page.number || target.page.outputPageNumber || 0).padStart(2, '0')
     const slot = String(target.slotIndex).padStart(2, '0')
     const type = match.source.candidate.blob?.type || target.candidate.blob?.type || 'image/jpeg'
     const ext = extensionFor(type, target.candidate.originalName || target.candidate.name || '')
     const name = `02-Report-Photos/page-${page}_slot-${slot}_${safeAscii(target.slot.code || target.slot.slotCode || '')}.${ext}`
-    files.push({ name, bytes: new Uint8Array(match.processedBuffer) })
+    files.push({ name, bytes: new Uint8Array(outputBuffer) })
     recoveryReport.push({
       projectName: target.project.name || '',
       pageNumber: target.page.number || target.page.outputPageNumber || '',
@@ -735,6 +768,8 @@ async function downloadDeepRecovered() {
       sourceCandidateId: match.source.candidate.id || '',
       processedActualBytes: match.processedActualBytes,
       originalActualBytes: match.originalActualBytes,
+      exportedVariant,
+      exportedBytes: outputBuffer.byteLength,
       crop: target.candidate.crop || null,
       width: target.candidate.width || null,
       height: target.candidate.height || null,
@@ -745,17 +780,18 @@ async function downloadDeepRecovered() {
     await new Promise(resolve => setTimeout(resolve, 0))
   }
 
-  const mapHeaders = ['projectName', 'pageNumber', 'pageTitle', 'slotIndex', 'slotCode', 'selectedCandidateIndex', 'selectedCandidateId', 'sourcePageNumber', 'sourceSlotIndex', 'sourceCandidateIndex', 'sourceCandidateId', 'processedActualBytes', 'originalActualBytes', 'fileName']
+  const mapHeaders = ['projectName', 'pageNumber', 'pageTitle', 'slotIndex', 'slotCode', 'selectedCandidateIndex', 'selectedCandidateId', 'sourcePageNumber', 'sourceSlotIndex', 'sourceCandidateIndex', 'sourceCandidateId', 'processedActualBytes', 'originalActualBytes', 'exportedVariant', 'exportedBytes', 'fileName']
   const mapRows = recoveryReport.map(record => mapHeaders.map(key => String(record[key] ?? '').replace(/[\t\r\n]+/g, ' ')).join('\t'))
   files.push({ name: '03-Project-Package/recovery-map.tsv', bytes: new TextEncoder().encode(`\uFEFF${[mapHeaders.join('\t'), ...mapRows].join('\r\n')}\r\n`) })
-  files.push({ name: 'README.txt', bytes: new TextEncoder().encode('Every exported image was matched to the selected target by both processed-image byte length and original-image byte length. Exact existing processed JPEG bytes are exported without re-encoding.\r\n') })
+  files.push({ name: 'README.txt', bytes: new TextEncoder().encode('Each exported image was recovered from the complete candidate pool. Exact matching processed JPEG bytes are preserved without re-encoding; when only a uniquely matched original is available, the saved crop metadata is used to rebuild the processed image.\r\n') })
   files.push({ name: '03-Project-Package/recovery-report.json', bytes: new TextEncoder().encode(JSON.stringify({ scannedAt: deepResult.scannedAt, exportedAt: new Date().toISOString(), method: 'all-candidate-pool-dual-byte-match', recovered: recoveryReport.length, records: recoveryReport }, null, 2)) })
   files.push({ name: '03-Project-Package/manifest.json', bytes: new TextEncoder().encode(JSON.stringify(archiveManifest(deepResult.project), null, 2)) })
 
   const archive = zipArchive(files)
   if (['127.0.0.1', 'localhost'].includes(location.hostname)) window.__recoveryArchive = archive
   triggerDownload(archive, `${safeAscii(deepResult.project.name || 'FAI-project')}_deep-recovered-powerpoint-import.zip`)
-  statusBox.textContent = `深度恢复 ZIP 已生成：${recoveryReport.length} 张均经过原图与处理图双重匹配，处理图字节原样导出，没有重新压缩。`
+  const rebuiltCount = recoveryReport.filter(item => item.exportedVariant === 'rebuilt-from-uniquely-matched-original').length
+  statusBox.textContent = `深度恢复 ZIP 已生成：共 ${recoveryReport.length} 张；${recoveryReport.length - rebuiltCount} 张处理图原样导出，${rebuiltCount} 张按保存的裁切参数从唯一匹配原图重建。`
   downloadButton.disabled = false
   reportButton.disabled = false
 }
