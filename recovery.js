@@ -29,20 +29,22 @@ async function sha256(value) {
 }
 
 async function openExistingDb() {
-  if (indexedDB.databases) {
-    const databases = await indexedDB.databases()
-    if (!databases.some(item => item.name === DB_NAME)) {
-      throw new Error('此浏览器中没有找到 FAI 照片数据库。请用原来拍照的浏览器或主屏幕 App 打开。')
-    }
-  }
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME)
+    const timer = window.setTimeout(() => reject(new Error('打开数据库超过 15 秒。请保持 HOME APP 在前台后重试。')), 15000)
     request.onupgradeneeded = () => {
       request.transaction.abort()
+      window.clearTimeout(timer)
       reject(new Error('数据库不存在；已阻止创建空数据库。'))
     }
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error || new Error('无法打开照片数据库。'))
+    request.onsuccess = () => {
+      window.clearTimeout(timer)
+      resolve(request.result)
+    }
+    request.onerror = () => {
+      window.clearTimeout(timer)
+      reject(request.error || new Error('无法打开照片数据库。'))
+    }
   })
 }
 
@@ -53,19 +55,24 @@ function readWorkspace(db) {
       return
     }
     const tx = db.transaction(STORE_NAME, 'readonly')
+    const timer = window.setTimeout(() => {
+      try { tx.abort() } catch {}
+      reject(new Error('读取项目记录超过 30 秒。数据库中的照片对象可能已损坏。'))
+    }, 30000)
     const store = tx.objectStore(STORE_NAME)
     const workspaceRequest = store.get('workspace')
     workspaceRequest.onsuccess = () => {
       if (workspaceRequest.result) {
+        window.clearTimeout(timer)
         resolve(workspaceRequest.result)
         return
       }
       const legacyRequest = store.get('active')
-      legacyRequest.onsuccess = () => resolve(legacyRequest.result)
-      legacyRequest.onerror = () => reject(legacyRequest.error)
+      legacyRequest.onsuccess = () => { window.clearTimeout(timer); resolve(legacyRequest.result) }
+      legacyRequest.onerror = () => { window.clearTimeout(timer); reject(legacyRequest.error) }
     }
-    workspaceRequest.onerror = () => reject(workspaceRequest.error)
-    tx.onerror = () => reject(tx.error)
+    workspaceRequest.onerror = () => { window.clearTimeout(timer); reject(workspaceRequest.error) }
+    tx.onerror = () => { window.clearTimeout(timer); reject(tx.error) }
   })
 }
 
