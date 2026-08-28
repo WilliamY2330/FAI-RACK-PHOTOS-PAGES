@@ -53,7 +53,7 @@
       <section id="recovery" class="hidden">
         <h2>恢复扫描</h2>
         <p class="safe">只读模式：页面不会建立任何写入事务。</p>
-        <p>先读取本机项目列表，选择需要恢复的一个项目。每个 point 只恢复原应用中已经选中的那张照片，再依次尝试它的原图、处理图和缩略图副本。</p>
+        <p>先读取本机项目列表，选择需要恢复的一个项目。每个 point 只恢复原应用中已经选中的那张照片；快速恢复模式只尝试处理图和缩略图，跳过原图。</p>
         <button id="load-projects">读取本机项目列表</button>
         <label for="project">选择要恢复的项目</label>
         <select id="project" disabled><option value="">请先读取项目列表</option></select>
@@ -66,6 +66,6 @@
         <p><small>ZIP 会生成 PowerPoint 导入器需要的项目清单和照片目录。文件按页面和 point 顺序排列；未选中的候选照片不会进入最终恢复包。</small></p>
       </section>
     </main>
-    <script type="module" src="./recovery.js"></script>
+    <script type="module" src="./recovery.js?v=20260828-3"></script>
   </body>
 </html>
