@@ -115,13 +115,95 @@ function allCandidates(workspace, projectId) {
   return items
 }
 
-async function probeBlob(blob) {
+function withTimeout(promise, milliseconds, message) {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), milliseconds)
+    promise.then(value => {
+      window.clearTimeout(timer)
+      resolve(value)
+    }, error => {
+      window.clearTimeout(timer)
+      reject(error)
+    })
+  })
+}
+
+function fileReaderBuffer(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result)
+    reader.onerror = () => reject(reader.error || new Error('FileReader failed'))
+    reader.onabort = () => reject(new Error('FileReader aborted'))
+    reader.readAsArrayBuffer(blob)
+  })
+}
+
+function decodedImageBuffer(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob)
+    const image = new Image()
+    const finish = () => URL.revokeObjectURL(url)
+    image.onerror = () => {
+      finish()
+      reject(new Error('Image decoder could not open the local object'))
+    }
+    image.onload = () => {
+      try {
+        const canvas = document.createElement('canvas')
+        canvas.width = image.naturalWidth
+        canvas.height = image.naturalHeight
+        const context = canvas.getContext('2d')
+        if (!context) throw new Error('Canvas decoder unavailable')
+        context.drawImage(image, 0, 0)
+        canvas.toBlob(async recovered => {
+          finish()
+          if (!recovered) return reject(new Error('Image decoder produced no bytes'))
+          try {
+            resolve(await recovered.arrayBuffer())
+          } catch (error) {
+            reject(error)
+          }
+        }, blob.type === 'image/png' ? 'image/png' : 'image/jpeg', 0.95)
+      } catch (error) {
+        finish()
+        reject(error)
+      }
+    }
+    image.src = url
+  })
+}
+
+async function recoverBlobBuffer(blob, field, preferredMethod = '') {
+  const methods = [
+    ['direct', () => blob.arrayBuffer()],
+    ['fileReader', () => fileReaderBuffer(blob)],
+  ]
+  if (field !== 'originalBlob') methods.push(['imageDecoder', () => decodedImageBuffer(blob)])
+  if (preferredMethod) methods.sort(([name]) => name === preferredMethod ? -1 : 1)
+  const errors = []
+  for (const [method, read] of methods) {
+    try {
+      const buffer = await withTimeout(Promise.resolve().then(read), 10000, `${method} timed out`)
+      if (buffer?.byteLength > 0) return { buffer, method }
+    } catch (error) {
+      errors.push(`${method}: ${error?.message || String(error)}`)
+    }
+  }
+  throw new Error(errors.join(' | ') || 'no readable bytes')
+}
+
+async function probeBlob(blob, field) {
   if (!(blob instanceof Blob) || blob.size <= 0) return { readable: false, reason: 'missing' }
   try {
     await blob.slice(0, Math.min(blob.size, 65536)).arrayBuffer()
-    return { readable: true, size: blob.size, type: blob.type || 'application/octet-stream' }
-  } catch (error) {
-    return { readable: false, size: blob.size, type: blob.type || '', reason: error?.message || String(error) }
+    return { readable: true, method: 'direct', size: blob.size, type: blob.type || 'application/octet-stream' }
+  } catch (quickError) {
+    try {
+      const recovered = await recoverBlobBuffer(blob, field)
+      return { readable: true, method: recovered.method, size: blob.size, recoveredBytes: recovered.buffer.byteLength, type: blob.type || 'application/octet-stream' }
+    } catch (deepError) {
+      return { readable: false, size: blob.size, type: blob.type || '', reason: `${quickError?.message || String(quickError)} | ${deepError?.message || String(deepError)}` }
+    }
   }
 }
 
@@ -145,7 +227,7 @@ async function scanDatabase() {
   for (const item of candidates) {
     const variants = []
     for (const field of ['originalBlob', 'blob', 'thumbnailBlob']) {
-      const result = await probeBlob(item.candidate[field])
+      const result = await probeBlob(item.candidate[field], field)
       variants.push({ field, ...result })
       progress.value += 1
       statusBox.textContent = `正在扫描：第 ${records.length + 1} / ${candidates.length} 个照片候选…`
@@ -335,7 +417,8 @@ async function downloadRecovered() {
       const blob = record.source.candidate[field]
       if (!variant || !(blob instanceof Blob)) continue
       try {
-        buffer = await blob.arrayBuffer()
+        const recovered = await recoverBlobBuffer(blob, field, variant.method)
+        buffer = recovered.buffer
         chosen = { field, blob }
         break
       } catch (error) {
