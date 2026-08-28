@@ -10,6 +10,7 @@ const progress = document.querySelector('#progress')
 const stats = document.querySelector('#stats')
 const downloadButton = document.querySelector('#download')
 const reportButton = document.querySelector('#report')
+const originalsButton = document.querySelector('#download-originals')
 const projectSelect = document.querySelector('#project')
 const scanButton = document.querySelector('#scan')
 const deepScanButton = document.querySelector('#deep-scan')
@@ -27,6 +28,11 @@ function showError(target, message) {
 async function sha256(value) {
   const bytes = new TextEncoder().encode(value)
   const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function sha256Buffer(buffer) {
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
@@ -319,6 +325,7 @@ async function scanDatabase() {
   progress.classList.remove('hidden')
   stats.classList.add('hidden')
   downloadButton.classList.add('hidden')
+  originalsButton.classList.add('hidden')
   reportButton.classList.add('hidden')
   statusBox.classList.remove('error')
   statusBox.textContent = '正在以只读方式打开数据库…'
@@ -379,6 +386,7 @@ async function deepScanCandidatePool() {
   progress.classList.remove('hidden')
   stats.classList.add('hidden')
   downloadButton.classList.add('hidden')
+  originalsButton.classList.add('hidden')
   reportButton.classList.add('hidden')
   statusBox.classList.remove('error')
   statusBox.textContent = '正在准备候选照片深度匹配…'
@@ -495,6 +503,7 @@ async function deepScanCandidatePool() {
     scannedAt: new Date().toISOString(),
     project: targets[0]?.project,
     targets,
+    pool,
     poolCount: pool.length,
     matches,
     unresolved,
@@ -508,6 +517,7 @@ async function deepScanCandidatePool() {
     <div class="stat"><strong>${unresolved.length}</strong>仍未匹配</div>`
   stats.classList.remove('hidden')
   reportButton.classList.remove('hidden')
+  originalsButton.classList.remove('hidden')
   if (!unresolved.length) downloadButton.classList.remove('hidden')
   statusBox.textContent = unresolved.length
     ? `深度扫描完成：精确找回 ${matches.size} / ${targets.length} 张；仍缺 ${unresolved.length} 张，已阻止生成不完整 ZIP。请下载诊断清单。`
@@ -796,6 +806,102 @@ async function downloadDeepRecovered() {
   reportButton.disabled = false
 }
 
+async function downloadRawOriginals() {
+  if (!deepResult?.pool?.length) throw new Error('请先完成“深度扫描全部候选照片”。')
+  originalsButton.disabled = true
+  downloadButton.disabled = true
+  reportButton.disabled = true
+  progress.classList.remove('hidden')
+  progress.max = deepResult.pool.length
+  progress.value = 0
+
+  const uniqueOriginals = new Map()
+  const candidateMap = []
+  for (const source of deepResult.pool) {
+    try {
+      const recovered = await readRawBlob(source.candidate.originalBlob)
+      const hash = await sha256Buffer(recovered.buffer)
+      if (!uniqueOriginals.has(hash)) {
+        uniqueOriginals.set(hash, {
+          buffer: recovered.buffer,
+          type: source.candidate.originalBlob?.type || 'image/jpeg',
+          originalName: source.candidate.originalName || source.candidate.name || '',
+        })
+      }
+      candidateMap.push({
+        pageNumber: source.page.number || source.page.outputPageNumber || '',
+        pageTitle: source.page.title || '',
+        slotIndex: source.slotIndex,
+        slotCode: source.slot.code || source.slot.slotCode || '',
+        candidateIndex: source.candidateIndex,
+        candidateId: source.candidate.id || '',
+        selected: source.slot.selectedCandidateId === source.candidate.id,
+        expectedOriginalBytes: expectedSize(source.candidate, 'originalBlob'),
+        actualOriginalBytes: recovered.buffer.byteLength,
+        originalSha256: hash,
+      })
+    } catch (error) {
+      candidateMap.push({
+        pageNumber: source.page.number || source.page.outputPageNumber || '',
+        pageTitle: source.page.title || '',
+        slotIndex: source.slotIndex,
+        slotCode: source.slot.code || source.slot.slotCode || '',
+        candidateIndex: source.candidateIndex,
+        candidateId: source.candidate.id || '',
+        selected: source.slot.selectedCandidateId === source.candidate.id,
+        expectedOriginalBytes: expectedSize(source.candidate, 'originalBlob'),
+        actualOriginalBytes: 0,
+        originalSha256: '',
+        error: error?.message || String(error),
+      })
+    }
+    progress.value += 1
+    statusBox.textContent = `正在读取并去重原图：${progress.value} / ${progress.max}；当前 ${uniqueOriginals.size} 个不同原图…`
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+
+  const files = []
+  const originalFiles = new Map()
+  let originalNumber = 0
+  for (const [hash, item] of uniqueOriginals) {
+    originalNumber += 1
+    const ext = extensionFor(item.type, item.originalName)
+    const name = `01-Raw-Originals/original-${String(originalNumber).padStart(3, '0')}_${hash.slice(0, 12)}.${ext}`
+    originalFiles.set(hash, name)
+    files.push({ name, bytes: new Uint8Array(item.buffer) })
+  }
+  for (const item of candidateMap) item.fileName = originalFiles.get(item.originalSha256) || ''
+
+  const cropSpecs = deepResult.targets.map(target => ({
+    pageNumber: target.page.number || target.page.outputPageNumber || '',
+    pageTitle: target.page.title || '',
+    slotIndex: target.slotIndex,
+    slotCode: target.slot.code || target.slot.slotCode || '',
+    selectedCandidateIndex: target.candidateIndex,
+    selectedCandidateId: target.candidate.id || '',
+    expectedProcessedBytes: expectedSize(target.candidate, 'blob'),
+    expectedOriginalBytes: expectedSize(target.candidate, 'originalBlob'),
+    crop: target.candidate.crop || null,
+    width: target.candidate.width || null,
+    height: target.candidate.height || null,
+    rotation: target.candidate.rotation || 0,
+    fineRotation: target.candidate.fineRotation || 0,
+    scale: target.candidate.scale || 1,
+    offsetX: target.candidate.offsetX || target.candidate.x || 0,
+    offsetY: target.candidate.offsetY || target.candidate.y || 0,
+  }))
+  files.push({ name: '03-Project-Package/original-candidate-map.json', bytes: new TextEncoder().encode(JSON.stringify(candidateMap, null, 2)) })
+  files.push({ name: '03-Project-Package/selected-crop-specs.json', bytes: new TextEncoder().encode(JSON.stringify(cropSpecs, null, 2)) })
+  files.push({ name: 'README.txt', bytes: new TextEncoder().encode(`This package contains every distinct raw original that the current IndexedDB record can actually read, deduplicated by SHA-256. The ${deepResult.pool.length} candidate references produced ${uniqueOriginals.size} distinct original files. Candidate mappings and all selected crop specifications are included.\r\n`) })
+
+  const archive = zipArchive(files)
+  triggerDownload(archive, `${safeAscii(deepResult.project.name || 'FAI-project')}_raw-originals-and-crop-data.zip`)
+  statusBox.textContent = `原图与裁剪数据 ZIP 已生成：扫描 ${deepResult.pool.length} 个候选引用，实际导出 ${uniqueOriginals.size} 个不同原图。`
+  originalsButton.disabled = false
+  downloadButton.disabled = false
+  reportButton.disabled = false
+}
+
 function publicReport() {
   if (deepResult) {
     return {
@@ -887,6 +993,13 @@ deepScanButton.addEventListener('click', async event => {
 
 downloadButton.addEventListener('click', () => downloadRecovered().catch(error => {
   showError(statusBox, `恢复包生成失败：${error?.message || String(error)}`)
+  downloadButton.disabled = false
+  reportButton.disabled = false
+}))
+
+originalsButton.addEventListener('click', () => downloadRawOriginals().catch(error => {
+  showError(statusBox, `原图包生成失败：${error?.message || String(error)}`)
+  originalsButton.disabled = false
   downloadButton.disabled = false
   reportButton.disabled = false
 }))
